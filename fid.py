@@ -21,11 +21,14 @@ import numpy as np
 import os
 import gzip, pickle
 import tensorflow as tf
-from scipy.misc import imread
+from imageio import imread
 from scipy import linalg
 import pathlib
 import urllib
+import cv2
 import warnings
+from skimage.measure import compare_ssim as ssim_f
+import math
 
 class InvalidFIDException(Exception):
     pass
@@ -34,7 +37,7 @@ class InvalidFIDException(Exception):
 def create_inception_graph(pth):
     """Creates a graph from saved GraphDef file."""
     # Creates graph from saved graph_def.pb.
-    with tf.io.gfile.FastGFile( pth, 'rb') as f:
+    with open( pth, 'rb') as f:
         graph_def = tf.compat.v1.GraphDef()
         graph_def.ParseFromString( f.read())
         _ = tf.import_graph_def( graph_def, name='FID_Inception_Net')
@@ -62,6 +65,14 @@ def _get_inception_layer(sess):
               o.__dict__['_shape_val'] = tf.TensorShape(new_shape)
     return pool3
 #-------------------------------------------------------------------------------
+
+
+def psnr_f(img1, img2):
+    mse = np.mean( (img1 - img2) ** 2 )
+    if mse == 0:
+        return 100
+    PIXEL_MAX = 255.0
+    return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
 
 
 def get_activations(images, sess, batch_size=50, verbose=False):
@@ -272,17 +283,37 @@ def check_or_download_inception(inception_path):
         fn, _ = request.urlretrieve(INCEPTION_URL)
         with tarfile.open(fn, mode='r') as f:
             f.extract('classify_image_graph_def.pb', str(model_file.parent))
+    print ('======================')
+    print (str(model_file))
     return str(model_file)
 
 
-def _handle_path(path, sess, low_profile=False):
+def _handle_path_fake(path, sess, low_profile=False):
     if path.endswith('.npz'):
         f = np.load(path)
         m, s = f['mu'][:], f['sigma'][:]
         f.close()
     else:
         path = pathlib.Path(path)
-        files = list(path.glob('*.jpg')) + list(path.glob('*.png'))
+        files = list(path.glob('*synthesized_image.jpg')) + list(path.glob('*synthesized_image.png'))
+        files.sort()
+        if low_profile:
+            m, s = calculate_activation_statistics_from_files(files, sess)
+        else:
+            x = np.array([imread(str(fn)).astype(np.float32) for fn in files])
+            m, s = calculate_activation_statistics(x, sess)
+            del x #clean up memory
+    return m, s
+
+def _handle_path_real(path, sess, low_profile=False):
+    if path.endswith('.npz'):
+        f = np.load(path)
+        m, s = f['mu'][:], f['sigma'][:]
+        f.close()
+    else:
+        path = pathlib.Path(path)
+        files = list(path.glob('*real_image.jpg')) + list(path.glob('*real_image.png'))
+        files.sort()
         if low_profile:
             m, s = calculate_activation_statistics_from_files(files, sess)
         else:
@@ -292,19 +323,60 @@ def _handle_path(path, sess, low_profile=False):
     return m, s
 
 
+
+def compare_ssim(path):
+    path = pathlib.Path(path)
+    files = list(path.glob('*real_image*.jpg')) + list(path.glob('*real_image*.png'))
+    files.sort()
+    dis_txt = open( os.path.join( os.path.dirname(path),  'ssim.txt')  ,'w')
+    ssims = []
+    # msssims = []
+    psnrs =[]
+    for i,d in enumerate(files):
+        # try:
+        real_path = str(d)
+        fake_path  = real_path.replace("_real_","_synthesized_")
+        
+        f_i = cv2.imread(fake_path)
+        r_i = cv2.imread(real_path)
+
+        f_i = cv2.cvtColor(f_i, cv2.COLOR_BGR2RGB)
+        r_i = cv2.cvtColor(r_i, cv2.COLOR_BGR2RGB)
+
+        
+        r_i = cv2.resize(r_i, (256,256), interpolation = cv2.INTER_AREA)
+        f_i = cv2.resize(f_i, (256,256), interpolation = cv2.INTER_AREA)
+        ssim = ssim_f(f_i,r_i,multichannel=True)
+        f_i = cv2.cvtColor(f_i, cv2.COLOR_RGB2GRAY)
+        r_i = cv2.cvtColor(r_i, cv2.COLOR_RGB2GRAY)
+        psnr = psnr_f(f_i,r_i)
+        psnrs.append(psnr)
+        ssims.append(ssim)
+        dis_txt.write(fake_path + "\t ssim: {:.4f},\t psnr: {:.4f}".format( ssim, psnr) + '\n') 
+        
+        
+        
+        # except:
+        #     print ('gggg')
+        #     continue
+    average_ssim = sum(ssims) / len(ssims)
+    average_psnr = sum(psnrs) / len(psnrs)
+    # average_msssim = sum(msssims) / len(msssims)
+    print ("Aeverage: ssim: {:.4f}, psnr: {:.4f}".format( average_ssim, average_psnr))
+    return  average_ssim, average_psnr
+
 def calculate_fid_given_paths(paths, inception_path, low_profile=False):
     ''' Calculates the FID of two paths. '''
     inception_path = check_or_download_inception(inception_path)
 
-    for p in paths:
-        if not os.path.exists(p):
-            raise RuntimeError("Invalid path: %s" % p)
+    if not os.path.exists(paths):
+        raise RuntimeError("Invalid path: %s" % paths)
 
     create_inception_graph(str(inception_path))
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
-        m1, s1 = _handle_path(paths[0], sess, low_profile=low_profile)
-        m2, s2 = _handle_path(paths[1], sess, low_profile=low_profile)
+        m1, s1 = _handle_path_real(paths, sess, low_profile=low_profile)
+        m2, s2 = _handle_path_fake(paths, sess, low_profile=low_profile)
         fid_value = calculate_frechet_distance(m1, s1, m2, s2)
         return fid_value
 
@@ -312,7 +384,7 @@ def calculate_fid_given_paths(paths, inception_path, low_profile=False):
 if __name__ == "__main__":
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument("path", type=str, nargs=2,
+    parser.add_argument("--path", type=str,
         help='Path to the generated images or to .npz statistic files')
     parser.add_argument("-i", "--inception", type=str, default=None,
         help='Path to Inception model (will be downloaded if not provided)')
@@ -324,3 +396,6 @@ if __name__ == "__main__":
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     fid_value = calculate_fid_given_paths(args.path, args.inception, low_profile=args.lowprofile)
     print("FID: ", fid_value)
+    average_ssim, average_psnr = compare_ssim(args.path)
+    print ("Aeverage:  ssim: {:.4f}, psnr: {:.4f}".format( average_ssim, average_psnr))
+    
